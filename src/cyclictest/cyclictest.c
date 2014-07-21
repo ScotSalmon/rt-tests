@@ -31,6 +31,7 @@
 #include <sys/sysinfo.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/resource.h>
 #include <sys/utsname.h>
 #include <sys/mman.h>
@@ -97,6 +98,7 @@ extern int clock_nanosleep(clockid_t __clock_id, int __flags,
 #define MODE_SYS_ITIMER		2
 #define MODE_SYS_NANOSLEEP	3
 #define MODE_SYS_OFFSET		2
+#define MODE_TIMERFD		4
 
 #define TIMER_RELTIME		0
 
@@ -668,6 +670,7 @@ try_again:
  * Modes:
  * - clock_nanosleep based
  * - cyclic timer based
+ * - timerfd based
  *
  * Clock:
  * - CLOCK_MONOTONIC
@@ -688,6 +691,8 @@ void *timerthread(void *param)
 	int stopped = 0;
 	cpu_set_t mask;
 	pthread_t thread;
+	int timerfd_id = 0;
+	unsigned long long timerfd_data = 0;
 
 	/* if we're running in numa mode, set our memory node */
 	if (par->node != -1)
@@ -716,6 +721,12 @@ void *timerthread(void *param)
 		sigev.sigev_notify_thread_id = stat->tid;
 		timer_create(par->clock, &sigev, &timer);
 		tspec.it_interval = interval;
+	}
+
+	if (par->mode == MODE_TIMERFD) {
+		timerfd_id = timerfd_create(par->clock, TFD_CLOEXEC);
+		if (timerfd_id == -1)
+			fatal("failed to create timerfd\n");
 	}
 
 	memset(&schedp, 0, sizeof(schedp));
@@ -753,6 +764,19 @@ void *timerthread(void *param)
 		itimer.it_interval.tv_sec = interval.tv_sec;
 		itimer.it_interval.tv_usec = interval.tv_nsec / 1000;
 		setitimer (ITIMER_REAL, &itimer, NULL);
+	}
+
+	if (par->mode == MODE_TIMERFD) {
+		tspec.it_interval.tv_sec = interval.tv_sec;
+		tspec.it_interval.tv_nsec = interval.tv_nsec;
+		if (par->timermode == TIMER_ABSTIME) {
+			tspec.it_value = next;
+			timerfd_settime(timerfd_id, TFD_TIMER_ABSTIME, &tspec, NULL);
+		} else {
+			tspec.it_value.tv_nsec = 0;
+			tspec.it_value.tv_sec = 1;
+			timerfd_settime(timerfd_id, 0, &tspec, NULL);
+		}
 	}
 
 	stat->threadstarted++;
@@ -808,6 +832,18 @@ void *timerthread(void *param)
 			next.tv_sec = now.tv_sec + interval.tv_sec;
 			next.tv_nsec = now.tv_nsec + interval.tv_nsec;
 			tsnorm(&next);
+			break;
+		case MODE_TIMERFD:
+			if (par->timermode == TIMER_ABSTIME) {
+				read(timerfd_id, &timerfd_data, 8);
+			} else {
+				clock_gettime(par->clock, &now);
+				timerfd_gettime(timerfd_id, &tspec);
+				read(timerfd_id, &timerfd_data, 8);
+				next.tv_sec = now.tv_sec + tspec.it_value.tv_sec;
+				next.tv_nsec = now.tv_nsec + tspec.it_value.tv_nsec;
+				tsnorm(&next);
+			}
 			break;
 		}
 
@@ -883,6 +919,10 @@ out:
 		setitimer (ITIMER_REAL, &itimer, NULL);
 	}
 
+	if (par->mode == MODE_TIMERFD) {
+		close(timerfd_id);
+	}
+
 	/* switch to normal */
 	schedp.sched_priority = 0;
 	sched_setscheduler(0, SCHED_OTHER, &schedp);
@@ -925,6 +965,7 @@ static void display_help(int error)
 	       "                           to modify value to minutes, hours or days\n"
 	       "-E       --event           event tracing (used with -b)\n"
 	       "-f       --ftrace          function trace (when -b is active)\n"
+	       "-F       --timerfd         use timerfd\n"
 	       "-h       --histogram=US    dump a latency histogram to stdout after the run\n"
                "                           (with same priority about many threads)\n"
 	       "                           US is the max time to be be tracked in microseconds\n"
@@ -971,6 +1012,7 @@ static void display_help(int error)
 static int use_nanosleep;
 static int timermode = TIMER_ABSTIME;
 static int use_system;
+static int use_timerfd;
 static int priority;
 static int policy = SCHED_OTHER;	/* default policy if not specified */
 static int num_threads = 1;
@@ -1054,6 +1096,7 @@ static void process_options (int argc, char *argv[])
 			{"distance", required_argument, NULL, 'd'},
 			{"event", no_argument, NULL, 'E'},
 			{"ftrace", no_argument, NULL, 'f'},
+			{"timerfd", no_argument, NULL, 'F'},
 			{"histogram", required_argument, NULL, 'h'},
 			{"histofall", required_argument, NULL, 'H'},
 			{"interval", required_argument, NULL, 'i'},
@@ -1085,7 +1128,7 @@ static void process_options (int argc, char *argv[])
 			{"priospread", no_argument, NULL, 'Q'},
 			{NULL, 0, NULL, 0}
 		};
-		int c = getopt_long(argc, argv, "a::b:Bc:Cd:Efh:H:i:Il:MnNo:O:p:PmqQrsSt::uUvD:wWT:y:e:",
+		int c = getopt_long(argc, argv, "a::b:Bc:Cd:EfFh:H:i:Il:MnNo:O:p:PmqQrsSt::uUvD:wWT:y:e:",
 				    long_options, &option_index);
 		if (c == -1)
 			break;
@@ -1111,6 +1154,7 @@ static void process_options (int argc, char *argv[])
 		case 'd': distance = atoi(optarg); break;
 		case 'E': enable_events = 1; break;
 		case 'f': tracetype = FUNCTION; ftrace = 1; break;
+		case 'F': use_timerfd = MODE_TIMERFD; break;
 		case 'H': histofall = 1; /* fall through */
 		case 'h': histogram = atoi(optarg); break;
 		case 'i': interval = atoi(optarg); break;
@@ -1480,7 +1524,7 @@ int main(int argc, char **argv)
 	if (check_timer())
 		warn("High resolution timers not available\n");
 
-	mode = use_nanosleep + use_system;
+	mode = use_timerfd ? use_timerfd : (use_nanosleep + use_system);
 
 	sigemptyset(&sigset);
 	sigaddset(&sigset, signum);
